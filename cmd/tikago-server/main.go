@@ -31,15 +31,43 @@ func envOrDefault(envVar string, alternates ...string) string {
 	return value
 }
 
-var maxAllowedBodyBytes = int64(1 << 10)
+var (
+	maxAllowedBodyBytes  = int64(1 << 10)
+	maxMultipartFormSize = int64(1 << 20)
+)
+
+const MultipartFormFileKey = "file"
+
 var errEmptyURLInGET = errors.New("empty \"url\" field")
+
+func parseFromMultipartForm(req *http.Request) (*tikago.Request, error) {
+	// If it is a multipart upload,
+	// assume the body is entirely the upload
+	if err := req.ParseMultipartForm(maxMultipartFormSize); err != nil {
+		return nil, err
+	}
+	mpartFile, mpartHeader, err := req.FormFile(MultipartFormFileKey)
+	if err != nil {
+		return nil, err
+	}
+	tReq := &tikago.Request{
+		Stdin:   mpartFile,
+		Headers: http.Header(mpartHeader.Header),
+	}
+	tReq.SetDone(req.MultipartForm.RemoveAll)
+	return tReq, nil
+}
 
 func parseTikagoRequest(req *http.Request) (*tikago.Request, error) {
 	defer req.Body.Close()
 
+	switch req.Header.Get("Content-Type") {
+	case "multipart/form-data":
+		return parseFromMultipartForm(req)
+	}
+
 	lr := io.LimitReader(req.Body, maxAllowedBodyBytes)
 	blob, err := ioutil.ReadAll(lr)
-	log.Printf("blob: %s err: %v", blob, err)
 	if err != nil {
 		return nil, err
 	}
@@ -53,6 +81,8 @@ func parseTikagoRequest(req *http.Request) (*tikago.Request, error) {
 				return nil, errEmptyURLInGET
 			}
 			blob = []byte(fmt.Sprintf(`{"url": %q}`, uri))
+		default:
+			return nil, fmt.Errorf("no body passed in for method %q", req.Method)
 		}
 	}
 
@@ -65,6 +95,7 @@ func parseTikagoRequest(req *http.Request) (*tikago.Request, error) {
 }
 
 func extract(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Trailer", "X-Tikago-Extras")
 	tikaReq, err := parseTikagoRequest(req)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -77,7 +108,6 @@ func extract(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	rw.Header().Set("Trailer", "X-Tikago-Extras")
 	n, err := io.Copy(rw, sr)
 	if n < 1 {
 		if err := <-sr.Errors(); err != nil {

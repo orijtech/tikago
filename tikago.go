@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 func ThisFilepath() string {
@@ -22,9 +23,62 @@ func ThisFileDir() string {
 }
 
 type Request struct {
+	sync.RWMutex
 	URL string `json:"url"`
 
+	Stdin   io.Reader
+	Headers http.Header
+
+	doneFn func() error
+
 	RoundTripper http.RoundTripper `json:"-"`
+}
+
+func (req *Request) Done() error {
+	req.RLock()
+	defer req.RUnlock()
+	if fn := req.doneFn; fn != nil {
+		return fn()
+	}
+	return nil
+}
+
+func (req *Request) SetDone(fn func() error) (oldDone func() error) {
+	req.Lock()
+	defer req.Unlock()
+
+	oldDone = req.doneFn
+	req.doneFn = fn
+
+	return oldDone
+}
+
+func signature(fn func() error) string {
+	return fmt.Sprintf("%p", fn)
+}
+
+func (req *Request) SetAndChainDone(fn func() error) {
+	if fn == nil {
+		return
+	}
+
+	req.Lock()
+	defer req.Unlock()
+
+	oldFn := req.doneFn
+	oldFnSig, newFnSig := signature(oldFn), signature(fn)
+	switch {
+	case req.doneFn == nil:
+		req.doneFn = fn
+	case oldFnSig != newFnSig:
+		req.doneFn = func() error {
+			err := oldFn()
+			if fErr := fn(); fErr != nil {
+				err = fErr
+			}
+			return err
+		}
+	}
 }
 
 type Response struct {
@@ -32,10 +86,18 @@ type Response struct {
 	Language string `json:"language"`
 }
 
+func (req *Request) HasStdin() bool {
+	return req.Stdin != nil
+}
+
 // Validate checks if a Request has the
 // necessary attributes set for it to be used.
 func (req *Request) Validate() error {
 	source := strings.TrimSpace(req.URL)
+	if req.HasStdin() {
+		return nil
+	}
+
 	var errsList []string
 	if source == "" {
 		errsList = append(errsList, "expecting \"url\"")
@@ -84,13 +146,25 @@ func (req *Request) Extract() (*StreamResult, error) {
 		return nil, err
 	}
 
-	res, err := req.fetch()
-	if err != nil {
-		return nil, err
-	}
+	var stdin io.Reader
+	var done func() error
 
-	if !StatusOK(res.StatusCode) {
-		return nil, fmt.Errorf("Status: %s. Headers: %v", res.Status, res.Header)
+	if req.HasStdin() {
+		stdin = req.Stdin
+		if closer, ok := stdin.(io.Closer); ok {
+			done = closer.Close
+		}
+	} else {
+		res, err := req.fetch()
+		if err != nil {
+			return nil, err
+		}
+
+		if !StatusOK(res.StatusCode) {
+			return nil, fmt.Errorf("Status: %s. Headers: %v", res.Status, res.Header)
+		}
+		stdin = res.Body
+		done = res.Body.Close
 	}
 
 	args := []string{
@@ -103,7 +177,7 @@ func (req *Request) Extract() (*StreamResult, error) {
 
 	// It is imperative that we read the source from stdin
 	cmd := exec.Command("java", args...)
-	cmd.Stdin = res.Body
+	cmd.Stdin = stdin
 	prc, pwc := io.Pipe()
 	cmd.Stdout = pwc
 	if err := cmd.Start(); err != nil {
@@ -113,7 +187,9 @@ func (req *Request) Extract() (*StreamResult, error) {
 	execErrs := make(chan error)
 	go func() {
 		defer close(execErrs)
-		defer res.Body.Close()
+		if done != nil {
+			defer done()
+		}
 		err := cmd.Wait()
 		_ = pwc.Close()
 		execErrs <- err
