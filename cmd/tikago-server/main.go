@@ -61,8 +61,12 @@ func parseFromMultipartForm(req *http.Request) (*tikago.Request, error) {
 func parseTikagoRequest(req *http.Request) (*tikago.Request, error) {
 	defer req.Body.Close()
 
-	switch req.Header.Get("Content-Type") {
-	case "multipart/form-data":
+	log.Printf("req: %v\n", req)
+	switch {
+	//  At times, the ContentType will be sent "multipart/form-data; boundary="
+	// for example: Content-Type:[multipart/form-data; boundary=------------------------6c9a36cd5c43e3fd]
+	// We should still be able to recognize that request as a multipart upload.
+	case strings.HasPrefix(req.Header.Get("Content-Type"), "multipart/form-data"):
 		return parseFromMultipartForm(req)
 	}
 
